@@ -127,3 +127,81 @@ def backward_decoder(dY, cache, model):
         dY = d_input_self + dQs @ Wq_s.T + dKs @ Wk_s.T + dVs @ Wv_s.T
 
     return dY, dZ_total, grads
+
+
+def backward_encoder(dZ, cache, model):
+    grads = {}
+    enc_layers = model["encoder_layers"]
+
+    dX = dZ
+    for layer_idx in reversed(range(len(enc_layers))):
+        lc = cache["enc_layers"][layer_idx]
+        Wq, Wk, Wv, W1, b1, W2, b2 = enc_layers[layer_idx]
+
+        d_add2 = backward_layer_norm(dX, lc["add2"])
+        d_norm1_ffn = d_add2.copy()
+        d_ffn_out = d_add2.copy()
+
+        dX_ffn, dW1, db1, dW2, db2 = backward_ffn(
+            d_ffn_out, lc["norm1"], W1, b1, W2, b2, lc["hidden_pre"], lc["hidden"]
+        )
+        d_norm1 = d_norm1_ffn + dX_ffn
+
+        grads[f"enc_{layer_idx}_W1"] = dW1
+        grads[f"enc_{layer_idx}_b1"] = db1
+        grads[f"enc_{layer_idx}_W2"] = dW2
+        grads[f"enc_{layer_idx}_b2"] = db2
+
+        d_add1 = backward_layer_norm(d_norm1, lc["add1"])
+        d_input_attn = d_add1.copy()
+        d_attn_out = d_add1.copy()
+
+        dQ, dK, dV = backward_attention(
+            d_attn_out, lc["Q"], lc["K"], lc["V"], lc["attn_weights"]
+        )
+
+        X_in = lc["input"]
+        grads[f"enc_{layer_idx}_Wq"] = np.einsum("bsi,bsj->ij", X_in, dQ)
+        grads[f"enc_{layer_idx}_Wk"] = np.einsum("bsi,bsj->ij", X_in, dK)
+        grads[f"enc_{layer_idx}_Wv"] = np.einsum("bsi,bsj->ij", X_in, dV)
+
+        dX = d_input_attn + dQ @ Wq.T + dK @ Wk.T + dV @ Wv.T
+
+    return dX, grads
+
+
+def backward_embeddings(d_enc_input, d_dec_input, cache, embedding_table):
+    d_emb = np.zeros_like(embedding_table)
+    enc_ids = cache["encoder_input_ids"]
+    dec_ids = cache["decoder_input_ids"]
+
+    for b in range(enc_ids.shape[0]):
+        for s in range(enc_ids.shape[1]):
+            d_emb[enc_ids[b, s]] += d_enc_input[b, s]
+
+    for b in range(dec_ids.shape[0]):
+        for s in range(dec_ids.shape[1]):
+            d_emb[dec_ids[b, s]] += d_dec_input[b, s]
+
+    return d_emb
+
+
+def full_backward(logits, targets, cache, model, pad_id=0):
+    grads = {}
+
+    dlogits = backward_cross_entropy_softmax(logits, targets, pad_id)
+
+    grads["W_out"] = np.einsum("bsi,bsj->ij", cache["dec_out"], dlogits)
+    d_dec_out = dlogits @ model["W_out"].T
+
+    d_dec_emb, dZ_from_dec, dec_grads = backward_decoder(d_dec_out, cache, model)
+    grads.update(dec_grads)
+
+    d_enc_emb, enc_grads = backward_encoder(dZ_from_dec, cache, model)
+    grads.update(enc_grads)
+
+    grads["embedding_table"] = backward_embeddings(
+        d_enc_emb, d_dec_emb, cache, model["embedding_table"]
+    )
+
+    return grads
